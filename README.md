@@ -92,8 +92,8 @@ One unit only: Xeon E5-1680 v2 (8 cores), FirePro D300, Fedora 44, kernel
 | 16-thread stage | stopped by the 80 °C guard after 255 s | ran the full 300 s |
 | CPU cores | 80 °C and still rising (~2 °C/min) | levelled off at ~74 °C |
 | Fan target under load | 790 rpm | 1225–1335 rpm |
-| SMC `TC0P` (CPU proximity) peak | 61.75 °C | 55.5 °C |
-| SMC `TM1a` peak | 77.5 °C | 72.5 °C |
+| SMC `TC0P` (CPU proximity) peak | 61.75 °C | 55.75 °C |
+| SMC `TM1a` peak | 77.5 °C | 72.75 °C |
 | After load | rose to 877 rpm only during cooldown | back to 950 rpm within ~20 s |
 
 Background load differed slightly between the runs, and room temperature was
