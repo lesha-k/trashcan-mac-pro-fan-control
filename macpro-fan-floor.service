@@ -1,0 +1,43 @@
+[Unit]
+Description=MacPro6,1 fan floor from CPU/GPU temperatures (SMC stays automatic)
+ConditionPathExists=/sys/devices/platform/applesmc.768/fan1_min
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/sbin/macpro-fan-floor --base 950
+# Covers crashes and watchdog kills: fall back to stock SMC behaviour.
+ExecStopPost=/bin/sh -c 'echo 790 > /sys/devices/platform/applesmc.768/fan1_min'
+Restart=always
+RestartSec=5
+WatchdogSec=30
+
+# Hardening. /sys stays writable (needed for fan1_min); everything else is locked.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,247 @@
+#!/usr/bin/python3 -I
+"""macpro-fan-floor: raise the MacPro6,1 SMC fan floor (fan1_min) from CPU/GPU temps.
+
+The SMC stays in automatic mode (fan1_manual=0) and may always spin the fan faster
+than this floor. Every write is clamped to [STOCK_MIN, fan1_max]; invalid readings
+fail toward cooling (SAFE_FLOOR); stopping restores STOCK_MIN (stock behaviour).
+"""
+import argparse
+import glob
+import os
+import signal
+import socket
+import sys
+import time
+
+STOCK_MIN = 790          # verified stock fan1_min on this unit
+DEFAULT_MAX = 1950       # used only if fan1_max reads implausibly
+SAFE_FLOOR = 1200        # floor when any expected sensor is missing/invalid
+TEMP_VALID = (10.0, 110.0)
+STEP_DOWN = 50           # max rpm decrease per interval (fast up, slow down)
+WRITE_DELTA = 25         # minimum change worth writing
+EXPECTED_GPUS = 2
+MAX_FAILS = 5            # consecutive failed writes before exiting non-zero
+SMC_REL = "sys/devices/platform/applesmc.768"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def interp(t, points):
+    """Piecewise-linear rpm for temperature t; flat below first / above last point."""
+    if t <= points[0][0]:
+        return points[0][1]
+    for (t0, r0), (t1, r1) in zip(points, points[1:]):
+        if t <= t1:
+            return r0 + (r1 - r0) * (t - t0) / (t1 - t0)
+    return points[-1][1]
+
+
+def cpu_curve(base, fmax):
+    return [(60, base), (80, 1500), (90, 1800), (92, fmax)]
+
+
+def gpu_curve(base, fmax):
+    return [(65, base), (85, 1500), (95, 1800), (97, fmax)]
+
+
+def read_text(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def read_temp(path):
+    try:
+        t = int(read_text(path)) / 1000.0
+    except (OSError, ValueError):
+        return None
+    return t if TEMP_VALID[0] <= t <= TEMP_VALID[1] else None
+
+
+def read_int(path):
+    try:
+        return int(read_text(path))
+    except (OSError, ValueError):
+        return None
+
+
+def sd_notify(msg):
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(addr)
+            s.sendall(msg.encode())
+    except OSError:
+        pass
+
+
+class Controller:
+    def __init__(self, root="/", base=950, dry_run=False):
+        if not STOCK_MIN <= base <= 1500:
+            raise ValueError(f"base {base} outside {STOCK_MIN}..1500")
+        self.root = root
+        self.base = base
+        self.dry_run = dry_run
+        self.smc = os.path.join(root, SMC_REL)
+        self.cur = None
+        self.last_written = None
+        self.cpu_path = None
+        self.gpu_paths = []
+        self.resolved_at = -1e9
+        self.warned = set()
+
+    def p(self, rel):
+        return os.path.join(self.root, rel)
+
+    def resolve(self):
+        self.cpu_path = None
+        for lab in sorted(glob.glob(self.p("sys/devices/platform/coretemp.*/hwmon/hwmon*/temp*_label"))):
+            try:
+                if read_text(lab) == "Package id 0":
+                    self.cpu_path = lab[: -len("_label")] + "_input"
+                    break
+            except OSError:
+                pass
+        gpus = []
+        for name in sorted(glob.glob(self.p("sys/class/hwmon/hwmon*/name"))):
+            try:
+                if read_text(name) == "amdgpu":
+                    gpus.append(os.path.join(os.path.dirname(name), "temp1_input"))
+            except OSError:
+                pass
+        self.gpu_paths = gpus
+        self.resolved_at = time.monotonic()
+
+    def warn_once(self, key, msg):
+        if key not in self.warned:
+            self.warned.add(key)
+            log("WARN " + msg)
+
+    def decide(self):
+        """Return (target_rpm, info dict). Pure apart from sensor reads."""
+        if self.cpu_path is None or len(self.gpu_paths) < EXPECTED_GPUS or time.monotonic() - self.resolved_at > 60:
+            self.resolve()
+        fmax = read_int(os.path.join(self.smc, "fan1_max"))
+        if fmax is None or not 1000 <= fmax <= 3000:
+            self.warn_once("fmax", f"fan1_max implausible ({fmax}); using {DEFAULT_MAX}")
+            fmax = DEFAULT_MAX
+        cpu = read_temp(self.cpu_path) if self.cpu_path else None
+        gpus = [read_temp(g) for g in self.gpu_paths]
+        reasons = []
+        if cpu is None:
+            want_cpu = SAFE_FLOOR
+            reasons.append("cpu-invalid")
+        else:
+            want_cpu = interp(cpu, cpu_curve(self.base, fmax))
+        valid = [g for g in gpus if g is not None]
+        want_gpu = max([interp(g, gpu_curve(self.base, fmax)) for g in valid] or [self.base])
+        if len(valid) < EXPECTED_GPUS:
+            want_gpu = max(want_gpu, SAFE_FLOOR)
+            reasons.append(f"gpu-invalid({len(valid)}/{EXPECTED_GPUS} valid)")
+        want = int(round(max(want_cpu, want_gpu)))
+        want = max(STOCK_MIN, min(fmax, want))
+        if self.cur is None or want >= self.cur:
+            self.cur = want
+        else:
+            self.cur = max(want, self.cur - STEP_DOWN)
+        self.cur = min(self.cur, fmax)
+        return self.cur, {"cpu": cpu, "gpus": gpus, "fmax": fmax, "reasons": reasons}
+
+    def write_min(self, rpm):
+        path = os.path.join(self.smc, "fan1_min")
+        if self.dry_run:
+            self.last_written = rpm
+            return True
+        try:
+            with open(path, "w") as f:
+                f.write(str(int(rpm)))
+        except OSError as e:
+            log(f"ERROR writing fan1_min={rpm}: {e}")
+            return False
+        rb = read_int(path)
+        if rb is None or abs(rb - rpm) > 10:
+            log(f"ERROR fan1_min readback {rb} != {rpm}")
+            return False
+        self.last_written = rpm
+        return True
+
+    def step(self):
+        """Return (rpm, info, ok); ok is False when a needed write failed."""
+        rpm, info = self.decide()
+        if self.last_written is None or abs(rpm - self.last_written) >= WRITE_DELTA or (
+            rpm != self.last_written and rpm in (self.base, info["fmax"], STOCK_MIN)
+        ):
+            prev = self.last_written
+            if not self.write_min(rpm):
+                return rpm, info, False
+            fan = read_int(os.path.join(self.smc, "fan1_input"))
+            g = "/".join("-" if x is None else f"{x:.0f}" for x in info["gpus"])
+            c = "-" if info["cpu"] is None else f"{info['cpu']:.0f}"
+            why = (" " + ",".join(info["reasons"])) if info["reasons"] else ""
+            log(f"{'DRY ' if self.dry_run else ''}fan1_min {prev} -> {rpm} (cpu {c}C, gpu {g}C, fan {fan}){why}")
+        return rpm, info, True
+
+    def restore(self):
+        if not self.dry_run:
+            self.write_min(STOCK_MIN)
+            log(f"restored fan1_min={STOCK_MIN} (stock)")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--base", type=int, default=950, help="idle floor rpm (790..1500)")
+    ap.add_argument("--interval", type=float, default=2.0)
+    ap.add_argument("--dry-run", action="store_true", help="print decisions, write nothing")
+    ap.add_argument("--root", default="/", help="filesystem root (tests)")
+    ap.add_argument("--once", action="store_true")
+    a = ap.parse_args(argv)
+
+    ctl = Controller(root=a.root, base=a.base, dry_run=a.dry_run)
+    manual = read_int(os.path.join(ctl.smc, "fan1_manual"))
+    if manual != 0:
+        log(f"WARN fan1_manual={manual}; SMC not in automatic mode, floor still applied")
+
+    def on_term(*_):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    log(f"start base={a.base} safe={SAFE_FLOOR} stock={STOCK_MIN} dry_run={a.dry_run}")
+    ready = False
+    fails = 0
+    last_beat = time.monotonic()
+    try:
+        while True:
+            rpm, info, ok = ctl.step()
+            if not ok:
+                fails += 1
+                if fails >= MAX_FAILS:
+                    log(f"ERROR {fails} consecutive failed writes; exiting so systemd restarts/fails the unit")
+                    return 1
+                time.sleep(a.interval)
+                continue
+            fails = 0
+            if not ready:
+                sd_notify("READY=1")
+                ready = True
+            sd_notify("WATCHDOG=1")
+            if a.dry_run and not a.once:
+                log(f"DRY target {rpm} cpu={info['cpu']} gpus={info['gpus']} fmax={info['fmax']} {info['reasons']}")
+            if time.monotonic() - last_beat >= 600:
+                last_beat = time.monotonic()
+                log(f"heartbeat fan1_min={ctl.last_written} cpu={info['cpu']} gpus={info['gpus']}")
+            if a.once:
+                break
+            time.sleep(a.interval)
+    finally:
+        ctl.restore()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
