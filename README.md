@@ -76,6 +76,17 @@ One unit only: Xeon E5-1680 v2 (8 cores), FirePro D300, Fedora 44, kernel
 --cpu-method matrixprod`, 4, 8 and then 16 workers, stopped automatically at
 80 °C or on any throttling.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/stock-dark.svg">
+  <img alt="Stock SMC curve: fan target flat at 790 rpm while the hottest core climbs to the 80 °C guard" src="docs/stock-light.svg" width="820">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/with-controller-dark.svg">
+  <img alt="With the controller: fan target rises to about 1335 rpm and the hottest core levels off near 74 °C" src="docs/with-controller-light.svg" width="820">
+</picture>
+
+
 | | Stock SMC curve | With this controller |
 |---|---|---|
 | 16-thread stage | stopped by the 80 °C guard after 255 s | ran the full 300 s |
@@ -87,6 +98,9 @@ One unit only: Xeon E5-1680 v2 (8 cores), FirePro D300, Fedora 44, kernel
 
 Background load differed slightly between the runs, and room temperature was
 not measured. Thermal throttle counters stayed at 0 in both runs.
+
+The 1-second samples for both runs are in [`docs/data/`](docs/data/). To
+redraw the charts, run `python3 -I docs/make_charts.py`.
 
 ## Requirements
 
